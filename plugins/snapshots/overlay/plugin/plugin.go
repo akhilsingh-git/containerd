@@ -32,6 +32,7 @@ import (
 const (
 	capaRemapIDs     = "remap-ids"
 	capaOnlyRemapIDs = "only-remap-ids"
+	capaSlowChown    = "slow-chown"
 )
 
 // Config represents configuration for the overlay plugin.
@@ -86,6 +87,8 @@ func init() {
 
 			if config.SlowChown {
 				oOpts = append(oOpts, overlay.WithSlowChown)
+				// Add slow-chown capability to signal that slow chown fallback is available
+				ic.Meta.Capabilities = append(ic.Meta.Capabilities, capaSlowChown)
 			} else {
 				// If slowChown is false, we use capaOnlyRemapIDs to signal we only
 				// allow idmap mounts.

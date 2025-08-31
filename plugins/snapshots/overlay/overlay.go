@@ -263,7 +263,117 @@ func (o *snapshotter) Usage(ctx context.Context, key string) (_ snapshots.Usage,
 }
 
 func (o *snapshotter) Prepare(ctx context.Context, key, parent string, opts ...snapshots.Opt) ([]mount.Mount, error) {
-	return o.createSnapshot(ctx, snapshots.KindActive, key, parent, opts)
+	var (
+		s        storage.Snapshot
+		td, path string
+		info     snapshots.Info
+		err      error
+	)
+
+	defer func() {
+		if err != nil {
+			if td != "" {
+				if err1 := os.RemoveAll(td); err1 != nil {
+					log.G(ctx).WithError(err1).Warn("failed to cleanup temp snapshot directory")
+				}
+			}
+			if path != "" {
+				if err1 := os.RemoveAll(path); err1 != nil {
+					log.G(ctx).WithError(err1).WithField("path", path).Error("failed to reclaim snapshot directory, directory may need removal")
+					err = fmt.Errorf("failed to remove path: %v: %w", err1, err)
+				}
+			}
+		}
+	}()
+
+	if err := o.ms.WithTransaction(ctx, true, func(ctx context.Context) (err error) {
+		snapshotDir := filepath.Join(o.root, "snapshots")
+		td, err = o.prepareDirectory(ctx, snapshotDir, snapshots.KindActive)
+		if err != nil {
+			return fmt.Errorf("failed to create prepare snapshot dir: %w", err)
+		}
+
+		s, err = storage.CreateSnapshot(ctx, snapshots.KindActive, key, parent, opts...)
+		if err != nil {
+			return fmt.Errorf("failed to create snapshot: %w", err)
+		}
+
+		_, info, _, err = storage.GetInfo(ctx, key)
+		if err != nil {
+			return fmt.Errorf("failed to get snapshot info: %w", err)
+		}
+
+		var (
+			mappedUID, mappedGID     = -1, -1
+			uidmapLabel, gidmapLabel string
+			needsRemap               = false
+		)
+		// NOTE: if idmapped mounts' supported by hosted kernel there may be
+		// no parents at all, so overlayfs will not work and snapshotter
+		// will use bind mount. To be able to create file objects inside the
+		// rootfs -- just chown this only bound directory according to provided
+		// {uid,gid}map. In case of one/multiple parents -- chown upperdir.
+		if v, ok := info.Labels[snapshots.LabelSnapshotUIDMapping]; ok {
+			uidmapLabel = v
+			needsRemap = true
+		}
+		if v, ok := info.Labels[snapshots.LabelSnapshotGIDMapping]; ok {
+			gidmapLabel = v
+			needsRemap = true
+		}
+
+		if needsRemap {
+			var idMap userns.IDMap
+			if err = idMap.Unmarshal(uidmapLabel, gidmapLabel); err != nil {
+				return fmt.Errorf("failed to unmarshal snapshot ID mapped labels: %w", err)
+			}
+			root, err := idMap.RootPair()
+			if err != nil {
+				return fmt.Errorf("failed to find root pair: %w", err)
+			}
+			mappedUID, mappedGID = int(root.Uid), int(root.Gid)
+		}
+
+		if mappedUID == -1 || mappedGID == -1 {
+			if len(s.ParentIDs) > 0 {
+				st, err := os.Stat(o.upperPath(s.ParentIDs[0]))
+				if err != nil {
+					return fmt.Errorf("failed to stat parent: %w", err)
+				}
+				stat, ok := st.Sys().(*syscall.Stat_t)
+				if !ok {
+					return fmt.Errorf("incompatible types after stat call: *syscall.Stat_t expected")
+				}
+				mappedUID = int(stat.Uid)
+				mappedGID = int(stat.Gid)
+			}
+		}
+
+		if mappedUID != -1 && mappedGID != -1 {
+			if o.slowChown {
+				// Use recursive chown for slow_chown fallback
+				if err := o.RecursiveChown(filepath.Join(td, "fs"), mappedUID, mappedGID); err != nil {
+					return fmt.Errorf("failed to recursive chown: %w", err)
+				}
+			} else {
+				// Use simple chown for idmap mounts
+				if err := os.Lchown(filepath.Join(td, "fs"), mappedUID, mappedGID); err != nil {
+					return fmt.Errorf("failed to chown: %w", err)
+				}
+			}
+		}
+
+		path = filepath.Join(snapshotDir, s.ID)
+		if err = os.Rename(td, path); err != nil {
+			return fmt.Errorf("failed to rename: %w", err)
+		}
+		td = ""
+
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return o.mounts(s, info), nil
 }
 
 func (o *snapshotter) View(ctx context.Context, key, parent string, opts ...snapshots.Opt) ([]mount.Mount, error) {
@@ -512,8 +622,16 @@ func (o *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 		}
 
 		if mappedUID != -1 && mappedGID != -1 {
-			if err := os.Lchown(filepath.Join(td, "fs"), mappedUID, mappedGID); err != nil {
-				return fmt.Errorf("failed to chown: %w", err)
+			if o.slowChown {
+				// Use recursive chown for slow_chown fallback
+				if err := o.RecursiveChown(filepath.Join(td, "fs"), mappedUID, mappedGID); err != nil {
+					return fmt.Errorf("failed to recursive chown: %w", err)
+				}
+			} else {
+				// Use simple chown for idmap mounts
+				if err := os.Lchown(filepath.Join(td, "fs"), mappedUID, mappedGID); err != nil {
+					return fmt.Errorf("failed to chown: %w", err)
+				}
 			}
 		}
 
@@ -633,4 +751,19 @@ func supportsIndex() bool {
 		return true
 	}
 	return false
+}
+
+// RecursiveChown recursively changes ownership of all files and directories
+// starting from the given path. This is used as a fallback when idmap mounts
+// are not available and slow_chown is enabled.
+func (o *snapshotter) RecursiveChown(path string, uid, gid int) error {
+	return filepath.Walk(path, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if err := os.Lchown(path, uid, gid); err != nil {
+			return fmt.Errorf("failed to chown %s: %w", path, err)
+		}
+		return nil
+	})
 }

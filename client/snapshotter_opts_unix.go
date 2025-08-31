@@ -33,6 +33,7 @@ import (
 const (
 	capaRemapIDs     = "remap-ids"
 	capaOnlyRemapIDs = "only-remap-ids"
+	capaSlowChown    = "slow-chown"
 )
 
 // WithRemapperLabels creates the labels used by any supporting snapshotter
@@ -100,7 +101,16 @@ func resolveSnapshotOptions(ctx context.Context, client *Client, snapshotterName
 		}
 	}
 
-	if capaOnlyRemap {
+	// Check if the snapshotter supports slow_chown fallback
+	hasSlowChown := false
+	for _, capa := range capabs {
+		if capa == capaSlowChown {
+			hasSlowChown = true
+			break
+		}
+	}
+
+	if capaOnlyRemap && !hasSlowChown {
 		return "", fmt.Errorf("snapshotter %q doesn't support idmap mounts on this host, configure `slow_chown` to allow a slower and expensive fallback", snapshotterName)
 	}
 
